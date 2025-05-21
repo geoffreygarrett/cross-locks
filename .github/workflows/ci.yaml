@@ -42,7 +42,7 @@ jobs:
 
       # 4️⃣  Tiny helper that downloads *pre-built* wasm-pack binaries
       #     – avoids the flaky curl | bash dance that broke the previous job
-      - uses: jetli/wasm-pack-action@v0.4
+      - uses: jetli/wasm-pack-action@v0.4.0
         if: matrix.backend == 'browser'
         with:
           version: 'latest'
