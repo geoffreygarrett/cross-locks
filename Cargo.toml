@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = true
+description = "Single-file, zero-dependency, FIFO-fair global locks with re-entrancy that work identically on native, browser-WASM, and single-thread test targets."
 
 [dependencies]
 async-trait = "0.1"
