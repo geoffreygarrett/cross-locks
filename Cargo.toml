@@ -1,0 +1,32 @@
+[package]
+name = "cross-locks"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2"
+
+# feature-gated deps
+once_cell = { version = "1.19", optional = true }
+futures = { version = "0.3", optional = true }
+tokio = { version = "1.45", optional = true, default-features = false, features = ["sync", "time", "macros"] }
+
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["Window", "Navigator", "LockManager", "AbortController", "AbortSignal", "Performance"] }
+js-sys = { version = "0.3", optional = true }
+
+[features]
+default = []
+native = ["tokio/rt-multi-thread", "tokio", "once_cell", "futures"]
+browser = ["tokio/rt", "tokio", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "js-sys", "futures"]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
