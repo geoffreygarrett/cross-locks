@@ -1,57 +1,70 @@
-# .github/workflows/ci.yaml
 name: CI
 
 on:
   push:
     branches: [ main ]
   pull_request:
-  workflow_dispatch:
+
+env:
+  # nice coloured logs
+  CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    # ----- 1. build a matrix of job variants ---------------------------
-    strategy:
-      fail-fast: false          # keep the other job running if one fails
-      matrix:
-        include:
-          # Native host tests (Ubuntu runner)
-          - os: ubuntu-latest
-            target: native
-          # Browser tests + wasm32
-          - os: ubuntu-latest
-            target: wasm
+    # one Ubuntu runner → the matrix fan-out happens *inside* the job
+    runs-on: ubuntu-latest
 
-    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        backend: [ native, browser ]
 
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
+      # 1️⃣  Checkout sources
+      - uses: actions/checkout@v4
 
-      - name: Install Rust tool-chain
-        uses: dtolnay/rust-toolchain@stable
+      # 2️⃣  Install a lean Rust toolchain + the wasm target
+      - uses: actions-rs/toolchain@v1
         with:
-          targets: wasm32-unknown-unknown    # adds wasm target once; no-op for native
-          components: clippy
+          profile: minimal          # no clippy/rustfmt to keep it fast
+          toolchain: stable
+          override: true
+          targets: wasm32-unknown-unknown
 
-      # ---------- Native back-end --------------------------------------
+      # 3️⃣  Cache the build artefacts between runs (⇢ much faster CI)
+      - uses: actions/cache@v4
+        with:
+          # target/ + cargo registry/git are enough
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # 4️⃣  Tiny helper that downloads *pre-built* wasm-pack binaries
+      #     – avoids the flaky curl | bash dance that broke the previous job
+      - uses: jetli/wasm-pack-action@v0.4
+        if: matrix.backend == 'browser'
+        with:
+          version: 'latest'
+
+      # 5️⃣  Native back-end tests (Tokio etc.)
       - name: Run native tests
-        if: matrix.target == 'native'
-        run: cargo test --all-features --features=native --verbose
+        if: matrix.backend == 'native'
+        run: cargo test --features nati ve --all-targets --verbose
 
-      # ---------- Browser/WASM back-end --------------------------------
-      - name: Install wasm-bindgen-cli + wasm-pack + Firefox
-        if: matrix.target == 'wasm'
+      # 6️⃣  Browser / Web-Worker tests (headless Firefox)
+      - name: Run browser tests (wasm32)
+        if: matrix.backend == 'browser'
+        env:
+          # `wasm-pack` downloads geckodriver automatically – no extra setup
+          WASM_BINDGEN_TEST_TIMEOUT: 60          # seconds; avoid rare timeouts
         run: |
-          cargo install wasm-bindgen-cli --locked
-          curl -L https://github.com/rustwasm/wasm-pack/releases/latest/download/wasm-pack-init.sh | bash
-          sudo apt-get update -yqq && sudo apt-get install -yqq firefox
-      - name: Run browser tests (headless Firefox)
-        if: matrix.target == 'wasm'
-        run: |
-          wasm-pack test --firefox --headless --features=browser
+          wasm-pack test --firefox --headless --features browser
+          # ↑ xvfb is NOT required when Firefox runs with --headless
 
-      # ---------- clippy / fmt placeholders (uncomment when ready) -----
-      # - name: Lint (clippy)
-      #   run: cargo clippy --all-targets --all-features -- -D warnings
-      # - name: Style check (rustfmt)
-      #   run: cargo fmt -- --check
+      # 7️⃣  (optional) upload the test artefacts for debugging
+      # - uses: actions/upload-artifact@v4
+      #   if: failure()
+      #   with:
+      #     name: wasm-failures
+      #     path: target/wasm32-unknown-unknown/debug/deps/*.wasm
