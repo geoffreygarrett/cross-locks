@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    # ——————————————————————————————————————————
+    # Add other OSes or Rust channels as needed
+    # ——————————————————————————————————————————
+    strategy:
+      matrix:
+        includes:
+          # “kind” drives the command matrix later
+          - { os: ubuntu-latest, kind: native }
+          - { os: ubuntu-latest, kind: wasm }
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+
+    steps:
+      #------------------------------------------------------------#
+      # 1.  Checkout sources
+      #------------------------------------------------------------#
+      - uses: actions/checkout@v4
+
+      #------------------------------------------------------------#
+      # 2.  Rust toolchain (uses actions-rs/toolchain)
+      #     Change channel/toolchain in one place ↓
+      #------------------------------------------------------------#
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal        # faster install, no docs
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          override: true
+
+      #------------------------------------------------------------#
+      # 3.  Cache Cargo registry + build artefacts
+      #------------------------------------------------------------#
+      - name: Cache cargo + target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      #------------------------------------------------------------#
+      # 4.  Install wasm-pack once per runner
+      #     (falls back to cache above on subsequent runs)
+      #------------------------------------------------------------#
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version 0.12.1
+
+      #------------------------------------------------------------#
+      # 5.  Test matrix
+      #------------------------------------------------------------#
+      - name: Run tests
+        env:
+          # quiesce verbose WebDriver logs
+          RUST_BACKTRACE: full
+          # make wasm-bindgen-test less chatty
+          WASM_BINDGEN_TEST_TIMEOUT: 30
+        run: |
+          set -euxo pipefail
+          if [ "${{ matrix.kind }}" = "native" ]; then
+            cargo test --all-features --features native --verbose
+          elif [ "${{ matrix.kind }}" = "wasm" ]; then
+            # headless Firefox is pre-installed on ubuntu-latest
+            wasm-pack test --firefox --headless --features browser
+          fi
+
+      #------------------------------------------------------------#
+      # 6.  (Optional) static analysis / coverage / fmt
+      #     Uncomment as you grow!
+      #------------------------------------------------------------#
+      # - name: Clippy lint
+      #   run: cargo clippy --all-targets --all-features -- -D warnings
+      #
+      # - name: Upload code coverage
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: coverage-lcov
+      #     path: target/coverage/lcov.info
