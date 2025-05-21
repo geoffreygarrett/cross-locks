@@ -50,7 +50,7 @@ jobs:
       # 5️⃣  Native back-end tests (Tokio etc.)
       - name: Run native tests
         if: matrix.backend == 'native'
-        run: cargo test --features nati ve --all-targets --verbose
+        run: cargo test --features native --all-targets --verbose
 
       # 6️⃣  Browser / Web-Worker tests (headless Firefox)
       - name: Run browser tests (wasm32)
