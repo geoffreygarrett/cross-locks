@@ -1,33 +1,90 @@
+#[package]
+#name = "cross-locks"
+#version = "0.1.0"
+#edition = "2021"
+#license = "MIT OR Apache-2.0"
+#publish = true
+#description = "Single-file, zero-dependency, FIFO-fair global locks with re-entrancy that work identically on native, browser-WASM, and single-thread test targets."
+#
+#[dependencies]
+#async-trait = "0.1"
+#thiserror = "2"
+#
+## feature-gated deps
+#once_cell = { version = "1.19", optional = true }
+#futures = { version = "0.3", optional = true }
+#tokio = { version = "1.45", optional = true, default-features = false, features = ["sync", "time", "macros"] }
+#
+#wasm-bindgen = { version = "0.2", optional = true }
+#wasm-bindgen-futures = { version = "0.4", optional = true }
+#web-sys = { version = "0.3", optional = true, features = ["Window", "Navigator", "LockManager", "AbortController", "AbortSignal", "Performance"] }
+#js-sys = { version = "0.3", optional = true }
+#sqlx = "0.8.1"
+#
+#[features]
+#default = []
+#native = ["tokio/rt-multi-thread", "tokio", "once_cell", "futures"]
+#browser = ["tokio/rt", "tokio", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "js-sys", "futures"]
+#
+#[dev-dependencies]
+#wasm-bindgen-test = "0.3"
+#gloo-timers = { version = "0.3", features = ["futures"] }
+#
+#[lints.rust]
+#unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
 [package]
 name = "cross-locks"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-publish = true
-description = "Single-file, zero-dependency, FIFO-fair global locks with re-entrancy that work identically on native, browser-WASM, and single-thread test targets."
+description = "FIFO-fair global locks that work identically on native, browser-WASM and head-less WASM."
 
 [dependencies]
 async-trait = "0.1"
 thiserror = "2"
 
-# feature-gated deps
+# ––––– feature-gated deps –––––
 once_cell = { version = "1.19", optional = true }
 futures = { version = "0.3", optional = true }
 tokio = { version = "1.45", optional = true, default-features = false, features = ["sync", "time", "macros"] }
 
+# browser-only deps
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-sys = { version = "0.3", optional = true, features = ["Window", "Navigator", "LockManager", "AbortController", "AbortSignal", "Performance"] }
 js-sys = { version = "0.3", optional = true }
+cfg-if = "1.0.0"
+
+# (only used in the doctests / examples, not in the crate itself)
+gloo-timers = { version = "0.3", optional = true, features = ["futures"] }
 
 [features]
-default = []
-native = ["tokio/rt-multi-thread", "tokio", "once_cell", "futures"]
-browser = ["tokio/rt", "tokio", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "js-sys", "futures"]
+default = []   # force the user to pick exactly ONE of the following
+
+native = [
+    "tokio/rt-multi-thread",
+    "tokio",
+    "once_cell",
+    "futures"
+]
+
+browser = [
+    "wasm",
+]
+
+wasm = [
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "web-sys",
+    "js-sys",
+    "futures",
+    "tokio/rt", # single-threaded runtime for wasm
+    "tokio"
+]
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(web_sys_unstable_apis)"] }

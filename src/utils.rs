@@ -13,10 +13,11 @@
 macro_rules! async_test {
     ($name:ident $body:block) => {
         /* ---- Browser (wasm32 + feature=browser) ------------------- */
-        #[cfg(all(target_arch = "wasm32", feature = "browser"))]
+        #[cfg(target_arch = "wasm32")]
         mod $name {
             use super::*;
             use wasm_bindgen_test::*;
+            #[cfg(feature = "browser")]
             wasm_bindgen_test_configure!(run_in_browser);
 
             #[wasm_bindgen_test]
@@ -24,7 +25,7 @@ macro_rules! async_test {
         }
 
         /* ---- Native (everything else) ---------------------------- */
-        #[cfg(not(all(target_arch = "wasm32", feature = "browser")))]
+        #[cfg(not(all(target_arch = "wasm32")))]
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn $name() $body
     };

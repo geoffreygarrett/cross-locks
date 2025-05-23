@@ -1,47 +1,46 @@
-//! # supabase-locks
+//! # cross‑locks
 //!
-//! A **single-file, zero-dependency** (outside of `async-trait`, `thiserror` and
-//! optional Tokio / wasm‐bindgen) implementation of Supabase/GoTrue-style
-//! _global exclusive locks_ that work **identically**:
+//! A **single‑source, zero‑dependency**¹ implementation of Supabase/GoTrue‑style
+//! *global exclusive locks* that work **identically** across every runtime.
 //!
-//! | target                     | feature flag | backend                         |
-//! |----------------------------|--------------|---------------------------------|
-//! | Native (Tokio, multi-thread)| `native`     | fair FIFO queue (`Notify`)      |
-//! | Browser WASM (2022+)*      | `browser`    | `Navigator.locks.request`       |
-//! | Tests / single-thread CLI  | _none_       | no-op passthrough               |
+//! | target / runtime                     | compile‑time feature | backend used by `DefaultLock` |
+//! |--------------------------------------|----------------------|--------------------------------|
+//! | Native (Tokio, multi‑thread)         | **`native`**         | fair FIFO queue (`Notify`)     |
+//! | Browser WASM (2022 + `navigator.locks`) | **`browser`**        | `Navigator.locks.request`      |
+//! | Head‑less WASM (Node / WASI / tests) | **`wasm`**           | no‑op passthrough              |
 //!
-//! \*Safari shipped support in 16.4 (2023-03).
-//! The crate auto-detects the right bounds (`?Send`) for `wasm32`.
+//! \* Safari shipped the LockManager API in 16.4 (2023‑03).
 //!
 //! ## Guarantees
+//! * **FIFO fairness** for every waiter requesting the *same* lock name on
+//!   native.
+//! * **Zero‑timeout try‑lock** (`Duration::ZERO`) mirrors the semantics of the
+//!   JS SDK.
+//! * **Task‑local re‑entrancy** helper demonstrated in the test‑suite.
+//! * `Arc<T>` automatically implements `GlobalLock`, ideal for storing in an
+//!   `Axum` `State`, `OnceCell`, etc.
 //!
-//! * **FIFO fairness** for all waiters that request the same `name` on native.
-//! * **Zero-timeout try-lock** semantics (`Duration::ZERO`) – mirrors JS SDK.
-//! * **Task-local re-entrancy** helper shown in the doc-tests below.
-//! * Works with `Arc<T>` out of the box – ideal for storing in Hyper / Axum
-//!   state or in a `OnceCell`.
+//! ---
+//! ¹ Outside the optional features listed below (`async‑trait`, `thiserror`,
+//!   Tokio / wasm‑bindgen).
 //!
 //! ```toml
-//! # Cargo.toml
+//! # Cargo.toml – choose exactly ONE backend
 //! [dependencies]
-//! async-trait = "0.1"
-//! thiserror   = "2"
-//!
-//! # pick ONE backend at compile-time
-//! default-features = false
-//! features = ["native"]       # or  "browser"
+//! cross-locks = { version = "*", default-features = false, features = ["native"] }
+//! # or  "browser"  |  "wasm"
 //! ```
 //!
 //! ```bash
-//! # run the exhaustive test-suite (native)
-//! cargo test --features nativ e
+//! # run the exhaustive native test‑suite
+//! cargo test --features native
 //!
-//! # browser smoke-test (headless Firefox via wasm-pack)
+//! # browser smoke‑test (headless Firefox)
 //! wasm-pack test --firefox --headless --features browser
 //! ```
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-pub mod utils;
+mod utils; // misc helpers shared by the native test‑suite
 
 use async_trait::async_trait;
 use std::{future::Future, sync::Arc, time::Duration};
@@ -52,8 +51,8 @@ use thiserror::Error;
 /// Errors returned by [`GlobalLock::with_lock`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LockError {
-    /// Timed-out while waiting to acquire the lock.
-    #[error("acquiring lock timed-out after {0:?}")]
+    /// Timed‑out while waiting to acquire the lock.
+    #[error("acquiring lock timed‑out after {0:?}")]
     Timeout(Duration),
 
     /// Browser only – the JS *Navigator LockManager* rejected the request.
@@ -64,23 +63,11 @@ pub enum LockError {
 
 /*────────────────────────── core abstraction ───────────────────────*/
 
-/// Trait implemented by every backend.
-///
-/// Two mutually-exclusive variants are compiled so that the **exact same API**
-/// is available, but the **`Send` bounds match the runtime**:
-///
-/// * native → futures **must be `Send`**
-/// * wasm32 → single-threaded, so the bounds disappear (`?Send`)
+/// Back‑end agnostic trait.
+/// *On `wasm32`* the `Send` bounds are automatically relaxed (`?Send`).
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 pub trait GlobalLock: Send + Sync + 'static {
-    /// Acquire (or fail) a **named exclusive lock**.
-    ///
-    /// * `name`   – arbitrary identifier (use dotted namespaces like `auth.cs`).
-    /// * `timeout`
-    ///   * `>0`  → wait at most that long
-    ///   * `0`   → immediate try-lock
-    ///   * `<0`  → wait forever
     async fn with_lock<R, F, Fut>(
         &self,
         name: &str,
@@ -108,9 +95,9 @@ pub trait GlobalLock: Send + Sync + 'static {
         R: 'static;
 }
 
-/*──────────── blanket impl so `Arc<T>` is a lock by itself ───────────*/
+/*──────── blanket impl so `Arc<T>` is itself a lock ─────────*/
 
-#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 impl<T: GlobalLock> GlobalLock for Arc<T> {
     async fn with_lock<R, F, Fut>(
@@ -128,7 +115,7 @@ impl<T: GlobalLock> GlobalLock for Arc<T> {
     }
 }
 
-#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl<T: GlobalLock> GlobalLock for Arc<T> {
     async fn with_lock<R, F, Fut>(
@@ -146,13 +133,14 @@ impl<T: GlobalLock> GlobalLock for Arc<T> {
     }
 }
 
-/*────────────────────────── no-op backend ──────────────────────────*/
+/*────────────────────────── no‑op backend ─────────────────────────*/
 
-/// Passthrough implementation (useful in tests / single-thread CLIs).
+/// Passthrough implementation – used by the `wasm` (Node/WASI) feature and in
+/// single‑thread CLI tests.
 #[derive(Clone, Debug, Default)]
 pub struct NoopLock;
 
-#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 impl GlobalLock for NoopLock {
     async fn with_lock<R, F, Fut>(&self, _: &str, _t: Duration, op: F) -> Result<R, LockError>
@@ -160,10 +148,12 @@ impl GlobalLock for NoopLock {
         F: FnOnce() -> Fut + 'static,
         Fut: Future<Output=R> + 'static,
         R: 'static,
-    { Ok(op().await) }
+    {
+        Ok(op().await)
+    }
 }
 
-#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl GlobalLock for NoopLock {
     async fn with_lock<R, F, Fut>(&self, _: &str, _t: Duration, op: F) -> Result<R, LockError>
@@ -171,10 +161,12 @@ impl GlobalLock for NoopLock {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output=R> + Send + 'static,
         R: Send + 'static,
-    { Ok(op().await) }
+    {
+        Ok(op().await)
+    }
 }
 
-/*──────────────────────── native FIFO backend ──────────────────────*/
+/*──────────────────────── native FIFO backend ─────────────────────*/
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod native_fifo {
     use super::*;
@@ -183,10 +175,9 @@ mod native_fifo {
     use tokio::sync::{Mutex, Notify};
 
     type Queue = VecDeque<Arc<Notify>>;
-    static QUEUES: Lazy<Mutex<HashMap<String, Queue>>> =
-        Lazy::new(|| Mutex::new(HashMap::new()));
+    static QUEUES: Lazy<Mutex<HashMap<String, Queue>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-    /// Tokio multi-thread FIFO lock – fair ordering & timeout.
+    /// Tokio **FIFO‑fair** global lock.
     #[derive(Clone, Debug, Default)]
     pub struct FifoLock;
 
@@ -205,7 +196,6 @@ mod native_fifo {
         {
             use tokio::time;
 
-            // enqueue myself
             let me = Arc::new(Notify::new());
             let pos = {
                 let mut map = QUEUES.lock().await;
@@ -214,21 +204,13 @@ mod native_fifo {
                 q.len() - 1
             };
 
-            // wait for turn (or timeout)
             if pos != 0 && time::timeout(timeout, me.notified()).await.is_err() {
-                // remove from queue after timeout
-                QUEUES
-                    .lock()
-                    .await
-                    .get_mut(name)
-                    .map(|q| q.retain(|n| !Arc::ptr_eq(n, &me)));
+                QUEUES.lock().await.get_mut(name).map(|q| q.retain(|n| !Arc::ptr_eq(n, &me)));
                 return Err(LockError::Timeout(timeout));
             }
 
-            // critical section
             let out = op().await;
 
-            // wake next
             if let Some(next) = {
                 let mut map = QUEUES.lock().await;
                 let q = map.get_mut(name).unwrap();
@@ -247,208 +229,28 @@ mod native_fifo {
 
 /*────────────────────── browser backend ───────────────────────────*/
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
-mod browser {
-    use super::*;
-    use futures::channel::oneshot;
-    use std::{cell::RefCell, collections::HashSet, rc::Rc};
-    use wasm_bindgen::prelude::*;
-    use wasm_bindgen::{closure::Closure, JsCast};
-    use wasm_bindgen_futures::future_to_promise;
-    use web_sys::AbortController;
-
-    /* ────────── 1.  API selection ────────── */
-
-    #[cfg(web_sys_unstable_apis)]
-    mod api {
-        pub(crate) use web_sys::{LockManager, LockOptions, NavigatorExt};
-    }
-
-    #[cfg(not(web_sys_unstable_apis))]
-    mod api {
-        use wasm_bindgen::prelude::*;
-        #[wasm_bindgen(inline_js = r#"
-            export function req_lock(name, opts, cb) {
-                return navigator.locks.request(name, opts, cb);
-            }"#)]
-        extern "C" {
-            #[wasm_bindgen(js_name = req_lock)]
-            fn req_lock(name: &str, opts: &JsValue, cb: &js_sys::Function);
-        }
-        pub(crate) fn request_lock(
-            n: &str,
-            opts: &JsValue,
-            cb: &js_sys::Function,
-        ) {
-            // just a JS call – no Rust-side safety issues
-            req_lock(n, opts, cb);
-        }
-    }
-
-    /* ────────── 2.  task-local re-entrancy guard ────────── */
-    thread_local! {
-        static ACTIVE: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
-    }
-
-    #[derive(Clone, Debug, Default)]
-    pub struct NavigatorLock;
-
-    #[async_trait(?Send)]
-    impl GlobalLock for NavigatorLock {
-        async fn with_lock<R, F, Fut>(
-            &self,
-            name: &str,
-            timeout: Duration,
-            op: F,
-        ) -> Result<R, LockError>
-        where
-            F: FnOnce() -> Fut + 'static,
-            Fut: Future<Output=R> + 'static,
-            R: 'static,
-        {
-            /* fast-fail for re-entrant try-lock */
-            if timeout.is_zero()
-                && ACTIVE.with(|s| s.borrow().contains(name))
-            {
-                return Err(LockError::Timeout(Duration::ZERO));
-            }
-
-            /* channel back to Rust */
-            let (tx, rx) = oneshot::channel::<R>();
-
-            /* share state between outer callback & inner async move */
-            let tx_cell = Rc::new(RefCell::new(Some(tx)));
-            let op_cell = Rc::new(RefCell::new(Some(op)));
-            let name_rc = Rc::new(name.to_owned());
-
-            let js_cb = Closure::<dyn FnMut() -> js_sys::Promise>::wrap(Box::new({
-                // first clones – they live for the whole lifetime of the callback
-                let tx_cell = tx_cell.clone();
-                let op_cell = op_cell.clone();
-                let name_rc = name_rc.clone();
-
-                move || {
-                    ACTIVE.with(|s| s.borrow_mut().insert((*name_rc).clone()));
-
-                    // second, “one-shot” clones – owned by the async block only
-                    let tx_cell2 = tx_cell.clone();
-                    let op_cell2 = op_cell.clone();
-                    let name_rc2 = name_rc.clone();
-
-                    future_to_promise(async move {
-                        let tx = tx_cell2
-                            .borrow_mut()
-                            .take()
-                            .expect("tx reused");
-                        let op = op_cell2
-                            .borrow_mut()
-                            .take()
-                            .expect("op reused");
-
-                        let _ = tx.send(op().await);
-
-                        ACTIVE.with(|s| s.borrow_mut().remove(&*name_rc2));
-                        Ok(JsValue::UNDEFINED)
-                    })
-                }
-            }));
-
-
-            /* build options and call LockManager */
-
-            #[cfg(web_sys_unstable_apis)]
-            {
-                use api::*;
-                let win = web_sys::window().expect("no Window");
-                let locks: LockManager = win.navigator().locks();
-
-                let mut opts = LockOptions::new();
-                if timeout.is_zero() {
-                    opts.if_available(true);
-                } else {
-                    let ac = AbortController::new().unwrap();
-                    let sig = ac.signal();
-                    let abort =
-                        Closure::<dyn FnMut()>::wrap(Box::new(move || ac.abort()));
-                    win.set_timeout_with_callback_and_timeout_and_arguments_0(
-                        abort.as_ref().unchecked_ref(),
-                        timeout.as_millis() as i32,
-                    )
-                        .unwrap();
-                    abort.forget();
-                    opts.signal(Some(&sig));
-                }
-
-                let _ = locks.request_with_options_and_callback(
-                    &*name_rc,
-                    &opts,
-                    js_cb.as_ref().unchecked_ref(),
-                );
-            }
-
-            #[cfg(not(web_sys_unstable_apis))]
-            {
-                use api::request_lock;
-
-                let opts_obj = {
-                    let o = js_sys::Object::new();
-                    js_sys::Reflect::set(&o, &"mode".into(), &"exclusive".into())
-                        .unwrap();
-
-                    if timeout.is_zero() {
-                        js_sys::Reflect::set(
-                            &o,
-                            &"ifAvailable".into(),
-                            &JsValue::TRUE,
-                        )
-                            .unwrap();
-                    } else {
-                        let ac = AbortController::new().unwrap();
-                        let sig = ac.signal();
-                        let abort =
-                            Closure::<dyn FnMut()>::wrap(Box::new(move || ac.abort()));
-                        web_sys::window()
-                            .unwrap()
-                            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                abort.as_ref().unchecked_ref(),
-                                timeout.as_millis() as i32,
-                            )
-                            .unwrap();
-                        abort.forget();
-                        js_sys::Reflect::set(&o, &"signal".into(), &sig).unwrap();
-                    }
-                    o
-                };
-
-                request_lock(
-                    &*name_rc,
-                    &opts_obj.into(),
-                    js_cb.as_ref().unchecked_ref(),
-                );
-            }
-
-            js_cb.forget(); /* one-shot */
-
-            rx.await.map_err(|_| LockError::Js("oneshot cancelled".into()))
-        }
-    }
-
-    /// `use supabase_locks::DefaultLock` in WASM builds.
-    pub type DefaultBrowser = NavigatorLock;
-}
-
+mod browser;
 
 /*──────── re-exports so user can depend on exactly one name ────────*/
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub type DefaultLock = native_fifo::DefaultNative;
 
-#[cfg(all(feature = "browser", target_arch = "wasm32"))]
-pub type DefaultLock = browser::DefaultBrowser;
+#[cfg(target_arch = "wasm32")]
+cfg_if::cfg_if! {
+    if #[cfg(feature = "browser")] {
+        pub type DefaultLock = browser::DefaultBrowser;
+    } else {
+        pub type DefaultLock = NoopLock;
+    }
+}
+
+// #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+// pub type DefaultLock = browser::DefaultBrowser;
 
 /*────────────────────────── exhaustive tests ───────────────────────*/
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /*===============================================================
      =                        NATIVE TESTS                           =
