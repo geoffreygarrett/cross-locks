@@ -34,7 +34,7 @@
 #unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
 [package]
 name = "cross-locks"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "FIFO-fair global locks that work identically on native, browser-WASM and head-less WASM."

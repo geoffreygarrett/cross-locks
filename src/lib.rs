@@ -45,6 +45,7 @@ mod utils; // misc helpers shared by the native test‑suite
 use async_trait::async_trait;
 use std::{future::Future, sync::Arc, time::Duration};
 use thiserror::Error;
+use futures::FutureExt;
 
 /*────────────────────────────── errors ──────────────────────────────*/
 
@@ -191,11 +192,14 @@ mod native_fifo {
         ) -> Result<R, LockError>
         where
             F: FnOnce() -> Fut + Send + 'static,
-            Fut: Future<Output=R> + Send + 'static,
+            Fut: Future<Output = R> + Send + 'static,
             R: Send + 'static,
         {
             use tokio::time;
+            use futures::FutureExt;               //  ← new
+            use std::panic::{self, AssertUnwindSafe};
 
+            // ── 1️⃣  enqueue our Notify handle ─────────────────────────────
             let me = Arc::new(Notify::new());
             let pos = {
                 let mut map = QUEUES.lock().await;
@@ -204,25 +208,41 @@ mod native_fifo {
                 q.len() - 1
             };
 
+            // ── 2️⃣  wait (with timeout) until we're at the head ───────────
             if pos != 0 && time::timeout(timeout, me.notified()).await.is_err() {
-                QUEUES.lock().await.get_mut(name).map(|q| q.retain(|n| !Arc::ptr_eq(n, &me)));
+                // timed-out ⇒ remove our entry and bail out
+                QUEUES
+                    .lock()
+                    .await
+                    .get_mut(name)
+                    .map(|q| q.retain(|n| !Arc::ptr_eq(n, &me)));
                 return Err(LockError::Timeout(timeout));
             }
 
-            let out = op().await;
+            // ── 3️⃣  run the critical section, *catching panics* ────────────
+            let result_or_panic = {
+                let fut = AssertUnwindSafe(op()).catch_unwind();
+                fut.await
+            };
 
+            // ── 4️⃣  ALWAYS clean up the queue & wake the next waiter ───────
             if let Some(next) = {
                 let mut map = QUEUES.lock().await;
                 let q = map.get_mut(name).unwrap();
-                q.pop_front();
-                q.front().cloned()
+                q.pop_front();               // remove *our* entry
+                q.front().cloned()           // next in FIFO (if any)
             } {
                 next.notify_one();
             }
 
-            Ok(out)
+            // ── 5️⃣  propagate success or re-panic ‐ like std::sync::Mutex ──
+            match result_or_panic {
+                Ok(val)   => Ok(val),
+                Err(panic) => panic::resume_unwind(panic),
+            }
         }
     }
+
 
     pub type DefaultNative = FifoLock;
 }
@@ -341,6 +361,48 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, LockError::Timeout(_)));
+        }
+
+        /// ❺  A panic inside the critical-section must NOT poison the lock.
+        ///
+        /// The first task grabs the lock, sleeps 5 ms, then panics.
+        /// A second task should still be able to obtain the same lock
+        /// (within 20 ms) once the first future unwinds.
+        /// Current implementation keeps the queue entry forever → times-out.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lock_is_released_after_panic() {
+            use tokio::{task, time::{sleep, Duration}};
+
+            let lock = DefaultLock::default();
+
+            // ── 1️⃣  spawn a task that panics while holding the lock ──────────
+            {
+                let l = lock.clone();
+                task::spawn(async move {
+                    // ignore the JoinError – we *want* this panicking branch
+                    let _ = std::panic::AssertUnwindSafe(
+                        l.with_lock("boom", Duration::from_secs(1), || async {
+                            sleep(Duration::from_millis(5)).await;
+                            panic!("intentional!");
+                        })
+                    )
+                        .catch_unwind()           // keep the test process alive
+                        .await;
+                });
+            }
+
+            // give the first task enough time to enter the CS & panic
+            sleep(Duration::from_millis(10)).await;
+
+            // ── 2️⃣  second attempt must succeed quickly if lock was cleaned up
+            let res = lock
+                .with_lock("boom", Duration::from_millis(20), || async {})
+                .await;
+
+            assert!(
+                res.is_ok(),
+                "lock remained poisoned – got {res:?} instead of Ok(())"
+            );
         }
     }
 
