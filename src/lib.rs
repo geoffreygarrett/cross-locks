@@ -45,7 +45,6 @@ mod utils; // misc helpers shared by the native test‑suite
 use async_trait::async_trait;
 use std::{future::Future, sync::Arc, time::Duration};
 use thiserror::Error;
-use futures::FutureExt;
 
 /*────────────────────────────── errors ──────────────────────────────*/
 
@@ -174,6 +173,7 @@ mod native_fifo {
     use once_cell::sync::Lazy;
     use std::collections::{HashMap, VecDeque};
     use tokio::sync::{Mutex, Notify};
+    use futures::FutureExt;
 
     type Queue = VecDeque<Arc<Notify>>;
     static QUEUES: Lazy<Mutex<HashMap<String, Queue>>> = Lazy::new(|| Mutex::new(HashMap::new()));
