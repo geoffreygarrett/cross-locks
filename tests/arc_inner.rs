@@ -1,7 +1,7 @@
 //! One source - runs under *native* (`cargo test --features native`)
 //! …and under *browser Wasm* (`wasm-pack test --firefox --headless --features browser`).
 
-use cross_locks::{async_test, DefaultLock, GlobalLock};
+use cross_locks::{cross_test, DefaultLock, GlobalLock};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
@@ -55,6 +55,36 @@ mod spawner_native {
 }
 #[cfg(not(target_arch = "wasm32"))]
 use spawner_native::Tokio as Spawner;
+
+// #[cfg(all(target_arch = "wasm32", feature = "browser"))]
+// pub async fn delay_ms(ms: u64) {
+//     use web_sys::js_sys::Promise;
+//     use wasm_bindgen::{closure::Closure, JsCast};
+//     use wasm_bindgen_futures::JsFuture;
+//
+//     // build a JS Promise that resolves after `ms` ms
+//     let promise = Promise::new(&mut |resolve, _reject| {
+//         let _ = web_sys::window()
+//             .unwrap()
+//             .set_timeout_with_callback_and_timeout_and_arguments_0(
+//                 resolve.unchecked_ref(),
+//                 ms as i32,
+//             );
+//     });
+//
+//     // turn it into a Rust `Future`
+//     let _ = JsFuture::from(promise).await;
+// }
+
+#[cfg(all(target_arch = "wasm32"))]
+pub async fn delay_ms(ms: u64) {
+    gloo_timers::future::TimeoutFuture::new(ms as u32).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn delay_ms(ms: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
 
 /* --------------------- browser / Wasm implementation ----------------- */
 
@@ -130,7 +160,7 @@ impl Client {
 
 /* ─────────────────────────── the dual test ─────────────────────────── */
 
-async_test! { arc_inner_reentrancy {
+cross_test! { arc_inner_reentrancy {
     let cli = Client::new();
 
     // fire 50 concurrent increments
@@ -145,3 +175,36 @@ async_test! { arc_inner_reentrancy {
 
     assert_eq!(cli.value().await, 50);
 }}
+
+
+// /// nested re-entrancy
+cross_test! { reentrant_lock {
+
+            let lock = DefaultLock::default();
+
+            // The receiver we call the method on
+            let lock_outer = lock.clone();
+
+            // Create a *second* clone that we are allowed to move
+            let lock_for_closure = lock_outer.clone();
+
+            let res = lock_outer
+                .with_reentrant("reentrant", move || {
+                    // Inside the closure we can freely clone / move this handle
+                    let lock_inner = lock_for_closure.clone();
+
+                    async move {
+                        // delay_ms(10).await;
+
+                        lock_inner
+                            .with_reentrant("reentrant", || async {
+                                // delay_ms(10).await;
+                                42
+                            })
+                            .await
+                    }
+                })
+                .await;
+
+            assert_eq!(res.unwrap(), Ok(42));
+        } }

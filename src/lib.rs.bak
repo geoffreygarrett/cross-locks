@@ -1,51 +1,58 @@
-//! # cross-locks
+//! # cross‑locks
 //!
-//! A single-source implementation of Supabase/GoTrue-style *global
-//! exclusive locks* that works in native, browser-WASM and head-less WASM
-//! with **zero external deps** apart from the optional feature crates.
+//! A **single‑source, zero‑dependency**¹ implementation of Supabase/GoTrue‑style
+//! *global exclusive locks* that work **identically** across every runtime.
 //!
-//! ┌────────────── target ───────────────┬─ feature ─┬─ backend used by `DefaultLock` ┐
-//! │  Native (Tokio, multi-thread)        │ `native`  │ fair FIFO queue (`Notify`)     │
-//! │  Browser WASM ( `navigator.locks`)   │ `browser` │ `Navigator.locks.request`      │
-//! │  Head-less WASM (Node / WASI)        │ `wasm`    │ no-op passthrough              │
-//! └──────────────────────────────────────┴───────────┴───────────────────────────────┘
+//! | target / runtime                     | compile‑time feature | backend used by `DefaultLock` |
+//! |--------------------------------------|----------------------|--------------------------------|
+//! | Native (Tokio, multi‑thread)         | **`native`**         | fair FIFO queue (`Notify`)     |
+//! | Browser WASM (2022 + `navigator.locks`) | **`browser`**        | `Navigator.locks.request`      |
+//! | Head‑less WASM (Node / WASI / tests) | **`wasm`**           | no‑op passthrough              |
 //!
-//! Guarantees
-//! ----------
-//! * FIFO-fairness for waiters on the *same* lock name (native backend).
-//! * Zero-timeout try-lock mirrors the JS SDK (`Duration::ZERO`).
-//! * Task-local re-entrancy helper.
-//! * `Arc<T>` automatically implements `GlobalLock`.
+//! \* Safari shipped the LockManager API in 16.4 (2023‑03).
+//!
+//! ## Guarantees
+//! * **FIFO fairness** for every waiter requesting the *same* lock name on
+//!   native.
+//! * **Zero‑timeout try‑lock** (`Duration::ZERO`) mirrors the semantics of the
+//!   JS SDK.
+//! * **Task‑local re‑entrancy** helper demonstrated in the test‑suite.
+//! * `Arc<T>` automatically implements `GlobalLock`, ideal for storing in an
+//!   `Axum` `State`, `OnceCell`, etc.
+//!
+//! ---
+//! ¹ Outside the optional features listed below (`async‑trait`, `thiserror`,
+//!   Tokio / wasm‑bindgen).
 //!
 //! ```toml
-//! # choose **exactly one** backend
+//! # Cargo.toml – choose exactly ONE backend
 //! [dependencies]
 //! cross-locks = { version = "*", default-features = false, features = ["native"] }
-//! # or: "browser" | "wasm"
+//! # or  "browser"  |  "wasm"
 //! ```
 //!
-//! ## Test-driving
 //! ```bash
-//! cargo test --features native            # exhaustive native suite
-//! wasm-pack test --firefox --headless \
-//!            --features browser           # browser smoke-test
+//! # run the exhaustive native test‑suite
+//! cargo test --features native
+//!
+//! # browser smoke‑test (headless Firefox)
+//! wasm-pack test --firefox --headless --features browser
 //! ```
-
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-mod utils; // helpers for the native test-suite
+mod utils; // misc helpers shared by the native test‑suite
 
 use async_trait::async_trait;
 use std::{future::Future, sync::Arc, time::Duration};
 use thiserror::Error;
 
-/*──────────────────────── errors ────────────────────────*/
+/*────────────────────────────── errors ──────────────────────────────*/
 
 /// Errors returned by [`GlobalLock::with_lock`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LockError {
-    /// Timed-out while waiting to acquire the lock.
-    #[error("acquiring lock timed-out after {0:?}")]
+    /// Timed‑out while waiting to acquire the lock.
+    #[error("acquiring lock timed‑out after {0:?}")]
     Timeout(Duration),
 
     /// Browser only – the JS *Navigator LockManager* rejected the request.
@@ -54,12 +61,10 @@ pub enum LockError {
     Js(String),
 }
 
-/*────────────────── core abstraction ───────────────────*/
+/*────────────────────────── core abstraction ───────────────────────*/
 
-/// Backend-agnostic async mutex.
-///
-/// *On `wasm32`* the `Send` bounds are relaxed automatically.
-/// Backend-agnostic async mutex (native build).
+/// Back‑end agnostic trait.
+/// *On `wasm32`* the `Send` bounds are automatically relaxed (`?Send`).
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 pub trait GlobalLock: Send + Sync + 'static {
@@ -70,48 +75,9 @@ pub trait GlobalLock: Send + Sync + 'static {
         op: F,
     ) -> Result<R, LockError>
     where
-        F:  FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = R> + Send + 'static,
-        R:  Send + 'static;
-
-    /// Re-entrant helper – lets the *same* task enter again without
-    /// trying to take the lock a second time.
-    async fn with_reentrant<'a, R, F, Fut>(
-        &'a self,
-        name: &'a str,
-        f: F,
-    ) -> Result<R, LockError>
-    where
-        F:  FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = R> + Send + 'static,
-        R:  Send + 'static,
-    {
-        use std::cell::Cell;
-        use tokio::task_local;
-
-        // one counter per async-task
-        task_local! { static DEPTH: Cell<usize>; }
-
-        // already inside → run immediately
-        if DEPTH.try_with(|c| c.get()).unwrap_or(0) > 0 {
-            return Ok(f().await);
-        }
-
-        // first entry → acquire the real lock **once**
-        DEPTH
-            .scope(Cell::new(1), async {
-                self.with_lock(name, Duration::MAX, || async {
-                    // bump depth for any nested calls
-                    DEPTH.with(|c| c.set(c.get() + 1));
-                    let out = f().await;
-                    DEPTH.with(|c| c.set(c.get() - 1));
-                    out                                // ← **no extra `Ok` here**
-                })
-                    .await
-            })
-            .await
-    }
-
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output=R> + Send + 'static,
+        R: Send + 'static;
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -124,46 +90,12 @@ pub trait GlobalLock: Send + Sync + 'static {
         op: F,
     ) -> Result<R, LockError>
     where
-        F:  FnOnce() -> Fut + 'static,
-        Fut: Future<Output = R> + 'static,
-        R:  'static;
-
-    async fn with_reentrant<'a, R, F, Fut>(
-        &'a self,
-        name: &'a str,
-        f: F,
-    ) -> Result<R, LockError>
-    where
-        F:  FnOnce() -> Fut + 'static,
-        Fut: Future<Output = R> + 'static,
-        R:  'static,
-    {
-        use std::cell::Cell;
-        use tokio::task_local;
-        // use futures_util::task_local;
-        // // use futures::task_local;
-
-        task_local! { static DEPTH: Cell<usize>; }
-
-        if DEPTH.try_with(|c| c.get()).unwrap_or(0) > 0 {
-            return Ok(f().await);
-        }
-
-        DEPTH
-            .scope(Cell::new(1), async {
-                self.with_lock(name, Duration::MAX, || async {
-                    DEPTH.with(|c| c.set(c.get() + 1));
-                    let out = f().await;
-                    DEPTH.with(|c| c.set(c.get() - 1));
-                    out
-                })
-                    .await
-            })
-            .await
-    }
-
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output=R> + 'static,
+        R: 'static;
 }
-/*──── blanket impl so `Arc<T>` **is** a lock ────*/
+
+/*──────── blanket impl so `Arc<T>` is itself a lock ─────────*/
 
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
@@ -201,9 +133,10 @@ impl<T: GlobalLock> GlobalLock for Arc<T> {
     }
 }
 
-/*─────────────────── no-op backend ───────────────────*/
+/*────────────────────────── no‑op backend ─────────────────────────*/
 
-/// Passthrough implementation – used in pure WASM/WASI or tests.
+/// Passthrough implementation – used by the `wasm` (Node/WASI) feature and in
+/// single‑thread CLI tests.
 #[derive(Clone, Debug, Default)]
 pub struct NoopLock;
 
@@ -233,20 +166,19 @@ impl GlobalLock for NoopLock {
     }
 }
 
-/*──────────────── native FIFO backend ───────────────*/
-
+/*──────────────────────── native FIFO backend ─────────────────────*/
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod native_fifo {
     use super::*;
     use once_cell::sync::Lazy;
     use std::collections::{HashMap, VecDeque};
     use tokio::sync::{Mutex, Notify};
+    use futures::FutureExt;
 
     type Queue = VecDeque<Arc<Notify>>;
-    static QUEUES: Lazy<Mutex<HashMap<String, Queue>>> =
-        Lazy::new(|| Mutex::new(HashMap::new()));
+    static QUEUES: Lazy<Mutex<HashMap<String, Queue>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-    /// Tokio **FIFO-fair** global lock.
+    /// Tokio **FIFO‑fair** global lock.
     #[derive(Clone, Debug, Default)]
     pub struct FifoLock;
 
@@ -260,25 +192,25 @@ mod native_fifo {
         ) -> Result<R, LockError>
         where
             F: FnOnce() -> Fut + Send + 'static,
-            Fut: Future<Output=R> + Send + 'static,
+            Fut: Future<Output = R> + Send + 'static,
             R: Send + 'static,
         {
-            use futures::FutureExt;
-            use std::panic::{self, AssertUnwindSafe};
             use tokio::time;
+            use futures::FutureExt;               //  ← new
+            use std::panic::{self, AssertUnwindSafe};
 
-            /* 1️⃣ enqueue our Notify handle */
+            // ── 1️⃣  enqueue our Notify handle ─────────────────────────────
             let me = Arc::new(Notify::new());
             let pos = {
                 let mut map = QUEUES.lock().await;
-                map.entry(name.into())
-                    .or_default()
-                    .push_back(me.clone());
-                map[&name.to_string()].len() - 1
+                let q = map.entry(name.into()).or_default();
+                q.push_back(me.clone());
+                q.len() - 1
             };
 
-            /* 2️⃣ wait (with timeout) until we’re at the head */
+            // ── 2️⃣  wait (with timeout) until we're at the head ───────────
             if pos != 0 && time::timeout(timeout, me.notified()).await.is_err() {
+                // timed-out ⇒ remove our entry and bail out
                 QUEUES
                     .lock()
                     .await
@@ -287,39 +219,39 @@ mod native_fifo {
                 return Err(LockError::Timeout(timeout));
             }
 
-            /* 3️⃣ run CS, catching panics */
+            // ── 3️⃣  run the critical section, *catching panics* ────────────
             let result_or_panic = {
                 let fut = AssertUnwindSafe(op()).catch_unwind();
                 fut.await
             };
 
-            /* 4️⃣ pop queue entry & wake next waiter */
+            // ── 4️⃣  ALWAYS clean up the queue & wake the next waiter ───────
             if let Some(next) = {
                 let mut map = QUEUES.lock().await;
                 let q = map.get_mut(name).unwrap();
-                q.pop_front();
-                q.front().cloned()
+                q.pop_front();               // remove *our* entry
+                q.front().cloned()           // next in FIFO (if any)
             } {
                 next.notify_one();
             }
 
-            /* 5️⃣ propagate */
+            // ── 5️⃣  propagate success or re-panic ‐ like std::sync::Mutex ──
             match result_or_panic {
-                Ok(v) => Ok(v),
-                Err(p) => panic::resume_unwind(p),
+                Ok(val)   => Ok(val),
+                Err(panic) => panic::resume_unwind(panic),
             }
         }
     }
 
+
     pub type DefaultNative = FifoLock;
 }
 
-/*──────── browser backend stub (unchanged) ────────*/
+/*────────────────────── browser backend ───────────────────────────*/
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 mod browser;
-// mod raii;
-/*──────── re-exports so downstream picks just one name ─────*/
 
+/*──────── re-exports so user can depend on exactly one name ────────*/
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub type DefaultLock = native_fifo::DefaultNative;
 
@@ -332,19 +264,25 @@ cfg_if::cfg_if! {
     }
 }
 
-/*────────────────────  exhaustive tests  ───────────────────*/
+// #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+// pub type DefaultLock = browser::DefaultBrowser;
 
+/*────────────────────────── exhaustive tests ───────────────────────*/
 #[cfg(test)]
 mod tests {
-    /*============================  native  ============================*/
+    use super::*;
+
+    /*===============================================================
+     =                        NATIVE TESTS                           =
+     ===============================================================*/
+
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     mod native {
-        use super::super::*;
-        use futures::{future::join_all, FutureExt};
-        use std::{sync::Arc, time::{Duration, Instant}};
+        use super::*;
+        use futures::future::join_all;
         use tokio::{task, time::sleep};
 
-        /// FIFO fairness
+        /// critical-sections never overlap (FIFO fairness)
         #[tokio::test(flavor = "multi_thread")]
         async fn fifo_is_exclusive() {
             let lock = DefaultLock::default();
@@ -356,89 +294,52 @@ mod tests {
                 let s = spans.clone();
                 jobs.push(task::spawn(async move {
                     l.with_lock("cs", Duration::from_secs(1), move || async move {
-                        let st = Instant::now();
+                        let st = std::time::Instant::now();
                         sleep(Duration::from_millis(10)).await;
-                        let et = Instant::now();
-                        s.lock()
-                            .await
-                            .push((st.elapsed().as_micros(), et.elapsed().as_micros()));
-                    })
-                        .await
-                        .unwrap();
+                        let et = std::time::Instant::now();
+                        s.lock().await.push((st.elapsed().as_micros(), et.elapsed().as_micros()));
+                    }).await.unwrap();
                 }));
             }
             join_all(jobs).await;
             let v = spans.lock().await.clone();
-            for w in v.windows(2) {
-                assert!(w[0].1 <= w[1].0, "critical sections overlapped");
+            for pair in v.windows(2) {
+                assert!(pair[0].1 <= pair[1].0, "critical sections overlapped");
             }
         }
 
-        /// zero-timeout semantics
+        /// zero-timeout succeeds when lock is free, fails when busy.
         #[tokio::test]
         async fn try_lock_semantics() {
             let lock = DefaultLock::default();
+
+            // immediately succeeds
             lock.with_lock("demo", Duration::ZERO, || async {}).await.unwrap();
 
+            // occupy lock
             let l2 = lock.clone();
             let _guard = task::spawn(async move {
                 l2.with_lock("demo", Duration::from_secs(1), || async {
                     sleep(Duration::from_millis(50)).await;
-                })
-                    .await
-                    .unwrap();
+                }).await.unwrap();
             });
 
             sleep(Duration::from_millis(5)).await;
 
+            // try-lock should now fail
             let err = lock
                 .with_lock("demo", Duration::ZERO, || async {})
                 .await
                 .unwrap_err();
             assert_eq!(err, LockError::Timeout(Duration::ZERO));
         }
-        /// nested re-entrancy
-        cross_test! { reentrant_lock {
-            use tokio::time::{sleep, Duration};
 
-            let lock = DefaultLock::default();
-
-            // The receiver we call the method on
-            let lock_outer = lock.clone();
-
-            // Create a *second* clone that we are allowed to move
-            let lock_for_closure = lock_outer.clone();
-
-            let res = lock_outer
-                .with_reentrant("reentrant", move || {
-                    // Inside the closure we can freely clone / move this handle
-                    let lock_inner = lock_for_closure.clone();
-
-                    async move {
-                        sleep(Duration::from_millis(10)).await;
-
-                        lock_inner
-                            .with_reentrant("reentrant", || async {
-                                sleep(Duration::from_millis(10)).await;
-                                42
-                            })
-                            .await
-                    }
-                })
-                .await;
-
-            assert_eq!(res.unwrap(), Ok(42));
-        } }
-
-
-        /// timeout propagates
+        /// timeout error propagates correctly
         #[tokio::test]
         async fn timeout_propagates() {
-            use std::future::Future;
-
             #[derive(Clone, Default)]
             struct Stubborn;
-            #[async_trait::async_trait]
+            #[async_trait]
             impl GlobalLock for Stubborn {
                 async fn with_lock<R, F, Fut>(
                     &self,
@@ -455,7 +356,6 @@ mod tests {
                     Err(LockError::Timeout(t))
                 }
             }
-
             let err = Stubborn::default()
                 .with_lock("x", Duration::from_millis(1), || async {})
                 .await
@@ -463,65 +363,84 @@ mod tests {
             assert!(matches!(err, LockError::Timeout(_)));
         }
 
-        /// panic inside CS must not poison the lock
+        /// ❺  A panic inside the critical-section must NOT poison the lock.
+        ///
+        /// The first task grabs the lock, sleeps 5 ms, then panics.
+        /// A second task should still be able to obtain the same lock
+        /// (within 20 ms) once the first future unwinds.
+        /// Current implementation keeps the queue entry forever → times-out.
         #[tokio::test(flavor = "multi_thread")]
-        async fn lock_released_after_panic() {
-            use futures::FutureExt;
+        async fn lock_is_released_after_panic() {
+            use tokio::{task, time::{sleep, Duration}};
 
             let lock = DefaultLock::default();
 
+            // ── 1️⃣  spawn a task that panics while holding the lock ──────────
             {
                 let l = lock.clone();
-                tokio::spawn(async move {
+                task::spawn(async move {
+                    // ignore the JoinError – we *want* this panicking branch
                     let _ = std::panic::AssertUnwindSafe(
                         l.with_lock("boom", Duration::from_secs(1), || async {
                             sleep(Duration::from_millis(5)).await;
                             panic!("intentional!");
-                        }),
+                        })
                     )
-                        .catch_unwind()
+                        .catch_unwind()           // keep the test process alive
                         .await;
                 });
             }
 
+            // give the first task enough time to enter the CS & panic
             sleep(Duration::from_millis(10)).await;
 
+            // ── 2️⃣  second attempt must succeed quickly if lock was cleaned up
             let res = lock
                 .with_lock("boom", Duration::from_millis(20), || async {})
                 .await;
 
-            assert!(res.is_ok(), "lock remained poisoned: {res:?}");
+            assert!(
+                res.is_ok(),
+                "lock remained poisoned – got {res:?} instead of Ok(())"
+            );
         }
     }
 
-    /*===========================  wasm  ===============================*/
+    /*===============================================================
+     =                     WASM (BROWSER) TESTS                      =
+     ===============================================================*/
+
     #[cfg(all(feature = "browser", target_arch = "wasm32"))]
     mod wasm {
-        use super::super::*;
+        use super::*;
         use gloo_timers::future::TimeoutFuture;
         use wasm_bindgen_test::*;
         wasm_bindgen_test_configure!(run_in_browser);
 
+        // Helper to grab high-resolution µs since page load
         fn micros() -> u128 {
             web_sys::window()
                 .unwrap()
                 .performance()
                 .unwrap()
-                .now() as u128
-                * 1_000
+                .now() as u128 * 1_000
         }
 
+        /// 1️⃣ Smoke-test: lock can be acquired when free (try-lock path).
         #[wasm_bindgen_test]
-        async fn free_trylock_succeeds() {
+        async fn navigator_free_trylock_succeeds() {
             DefaultLock::default()
                 .with_lock("free", Duration::ZERO, || async {})
                 .await
                 .unwrap();
         }
 
+        /// 2️⃣ Try-lock fails with `Timeout(0)` while another task is holding it.
         #[wasm_bindgen_test]
-        async fn trylock_times_out_when_busy() {
+        async fn navigator_trylock_times_out_when_busy() {
             let lock = DefaultLock::default();
+
+            // Spawn a future that holds the lock for 50 ms
             {
                 let l = lock.clone();
                 wasm_bindgen_futures::spawn_local(async move {
@@ -533,8 +452,10 @@ mod tests {
                 });
             }
 
+            // Yield to let the first future grab the lock
             TimeoutFuture::new(5).await;
 
+            // Immediate try-lock must fail
             let err = lock
                 .with_lock("busy", Duration::ZERO, || async {})
                 .await
@@ -542,36 +463,43 @@ mod tests {
             assert_eq!(err, LockError::Timeout(Duration::ZERO));
         }
 
+        /// 3️⃣ Critical-sections on the **same name** never overlap.
         #[wasm_bindgen_test]
-        async fn serialises_same_name() {
+        async fn navigator_serialises_same_name() {
             let lock = DefaultLock::default();
             let mut ts = vec![];
 
             for _ in 0..3 {
                 let l = lock.clone();
                 ts.push(async move {
-                    l.with_lock("fifo", Duration::from_secs(1), || async {
-                        let st = micros();
-                        TimeoutFuture::new(20).await;
-                        let et = micros();
-                        (st, et)
-                    })
+                    let (start, end) = l
+                        .with_lock("fifo", Duration::from_secs(1), || async {
+                            let st = micros();
+                            TimeoutFuture::new(20).await;
+                            let et = micros();
+                            (st, et)
+                        })
                         .await
-                        .unwrap()
+                        .unwrap();
+                    (start, end)
                 });
             }
 
             let mut spans = futures::future::join_all(ts).await;
             spans.sort_by_key(|s| s.0);
             for pair in spans.windows(2) {
-                assert!(pair[1].0 >= pair[0].1, "overlap detected");
+                assert!(
+                    pair[1].0 >= pair[0].1,
+                    "critical-sections overlapped in the browser backend"
+                );
             }
         }
 
+        /// 4️⃣ Locks with **different names** can overlap.
         #[wasm_bindgen_test]
-        async fn distinct_names_overlap() {
+        async fn navigator_distinct_names_overlap() {
             let a = DefaultLock::default();
-            let b = a.clone();
+            let b = a.clone(); // same backend, different name
 
             let t1 = a.with_lock("A", Duration::from_secs(1), || async {
                 TimeoutFuture::new(30).await;
@@ -584,6 +512,7 @@ mod tests {
             });
 
             let (end_a, end_b) = futures::join!(t1, t2);
+            // If they overlapped, B should finish before A completes its 30 ms sleep
             assert!(end_b.unwrap() < end_a.unwrap());
         }
     }
